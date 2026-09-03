@@ -35,6 +35,9 @@ care about first (from the engine's OptionType enum):
    13 ATTACK    attack with the active Pokemon
    14 END       end your turn
 An option's "inPlayArea" is 4 for your active Pokemon and 5 for the bench.
+
+Imports: the bundle ROOT is on sys.path, not this folder. A helper next to this
+file is imported as `from harness import helper`, not `import helper`.
 """
 import json
 import os

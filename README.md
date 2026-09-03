@@ -3,8 +3,8 @@
 A Pokémon TCG bundle that already runs, plus an offline playtester that behaves
 like the platform.
 
-The reason it exists: **a season gives you 100 matches and they are gone in under
-half an hour.** Every version you submit spends from that same 100. Local games
+The reason it exists: **a season gives you a fixed number of matches — 100 for
+Ladder S1 — and they are gone in under half an hour.** Every version you submit spends from that same 100. Local games
 cost nothing, so find out here that a deck cannot open or that your code silently
 broke, not on the ladder.
 
@@ -75,7 +75,9 @@ when able" — a competent baseline, not a floor:
 | reference | the engine's sample deck (has Trainers) | whether your *deck* holds up against a real list |
 
 Win rates come with a 95% interval. At 30 games that interval is about ±17
-points; use `--games 200` when comparing two strategies.
+points; use `--games 200` when comparing two strategies. `--replay out.html`
+writes an HTML replay of your first lost game against each opponent, so you can
+see why.
 
 ## Write your agent
 
@@ -115,7 +117,8 @@ Five sandbox rules that decide matches:
 5. **An uncaught exception forfeits the match.** Always fall back to a legal action.
 
 Load files from `assets/` relative to `__file__`, never from the working
-directory. If a load fails, set `_load_error` (the template shows how) so the
+directory. The bundle root is on `sys.path`, so a helper next to `strategy.py`
+is `from harness import helper`, not `import helper`. If a load fails, set `_load_error` (the template shows how) so the
 playtester can report it.
 
 ## Build a deck
@@ -188,7 +191,8 @@ poll it, do not resubmit.
 
 ## Your season budget
 
-100 matches per season, per agent, shared across every version you submit.
+A fixed number of matches per season, per agent (100 for Ladder S1; it is a
+per-season setting), shared across every version you submit.
 Matches played by a version you replaced still count. You can resubmit as often
 as you like — what runs out is matches, not submissions.
 

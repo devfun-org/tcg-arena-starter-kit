@@ -22,6 +22,7 @@ logging.getLogger("kaggle_environments").setLevel(logging.ERROR)
 ENGINE_VERSION = "1.32.0"
 CARDS_URL = "https://arena.dev.fun/api/arena/tcg/cards"
 MAX_LEGAL_ACTIONS = 1000          # full_match_runner.py MAX_LEGAL_ACTIONS
+MAX_DECISIONS = 1000              # full_match_runner.py MAX_DECISIONS: past this the platform voids the match
 IMPORT_BUDGET_MS = 1500           # hosted_runner.py startup validation
 DECISION_BUDGET_MS = 750          # arena-engine-tcg-panel-match.ts DECISION_BUDGET_MS
 MATCH_COMPUTE_BUDGET_MS = 15000   # entrant cumulative compute per match
@@ -141,8 +142,9 @@ class Worker:
 
 # --------------------------------------------------------------------------- deck validation
 
-def fetch_catalog():
-    raw = urllib.request.urlopen(CARDS_URL, timeout=60).read()
+def fetch_catalog(competition_id=None):
+    url = CARDS_URL + (f"?competitionId={competition_id}" if competition_id else "")
+    raw = urllib.request.urlopen(url, timeout=60).read()
     data = json.loads(raw)
     cards = data if isinstance(data, list) else data.get("cards", [])
     return {c["cardId"]: c for c in cards}
@@ -257,27 +259,29 @@ def greedy(deck):
     return agent
 
 
-def infer_reason(final_steps, my_index):
+def infer_reason(final_steps, my_index, i_lost):
     """The local env does not surface the platform's result reason. Each player's last
     observation is a slightly different snapshot (the loser's is one action stale), so
-    read both boards and take the first that explains the result."""
+    read both boards and take the first explanation consistent with the result."""
     def from_view(view):
         players = (view.get("current") or {}).get("players") or []
         if len(players) < 2:
             return None
         me, opp = players[my_index], players[1 - my_index]
-        if len(opp.get("prize") or []) == 0:
-            return "opponent took all prizes"
-        if not (me.get("active") or []) or (me.get("active") or [None])[0] is None:
-            return "no active Pokemon left"
-        if (me.get("deckCount") or 0) == 0:
-            return "decked out"
-        if len(me.get("prize") or []) == 0:
-            return "took all prizes"
-        if not (opp.get("active") or []):
-            return "opponent had no active Pokemon"
-        if (opp.get("deckCount") or 0) == 0:
-            return "opponent decked out"
+        if i_lost:
+            if len(opp.get("prize") or []) == 0:
+                return "opponent took all prizes"
+            if not (me.get("active") or []) or (me.get("active") or [None])[0] is None:
+                return "no active Pokemon left"
+            if (me.get("deckCount") or 0) == 0:
+                return "decked out"
+        else:
+            if len(me.get("prize") or []) == 0:
+                return "took all prizes"
+            if not (opp.get("active") or []) or (opp.get("active") or [None])[0] is None:
+                return "opponent had no active Pokemon"
+            if (opp.get("deckCount") or 0) == 0:
+                return "opponent decked out"
         return None
     try:
         views = [plain(st.get("observation") or {}) for st in final_steps]
@@ -293,7 +297,7 @@ def infer_reason(final_steps, my_index):
 def play_one(root, deck, opp_deck, game_no, stats):
     from kaggle_environments import make
     worker = Worker(root)
-    state = {"seq": 0, "forfeit": None, "last_view": None, "my_index": game_no % 2}
+    state = {"seq": 0, "forfeit": None, "void": None, "last_view": None, "my_index": game_no % 2}
     match_id = f"local-{game_no}"
 
     def me(obs):
@@ -307,7 +311,9 @@ def play_one(root, deck, opp_deck, game_no, stats):
         ctx = platform_context(match_id, state["seq"], view, offered)
         state["seq"] += 1
         stats["decisions"] += 1
-        if state["forfeit"]:
+        if state["seq"] > MAX_DECISIONS and not state["void"]:
+            state["void"] = "match_decision_limit"
+        if state["forfeit"] or state["void"]:
             return [-1]
         try:
             action, wall_ms, import_ms = worker.decide(ctx)
@@ -335,6 +341,10 @@ def play_one(root, deck, opp_deck, game_no, stats):
         if obs.get("select") is None:
             return list(opp_deck)
         state["seq"] += 1
+        if state["seq"] > MAX_DECISIONS and not state["void"]:
+            state["void"] = "match_decision_limit"
+        if state["void"]:
+            return [-1]
         a = legal_actions(plain(obs.get("select") or {}))
         return json.loads(a[0]) if a else []
 
@@ -346,16 +356,19 @@ def play_one(root, deck, opp_deck, game_no, stats):
         worker.close()
     last = res[-1]
     mine, theirs = last[state["my_index"]], last[1 - state["my_index"]]
+    if state["void"]:
+        return "void", f"{state['void']} (the platform voids matches past {MAX_DECISIONS} decisions; not counted)", env
     if state["forfeit"]:
-        return "forfeit", state["forfeit"].reason
+        return "forfeit", state["forfeit"].reason, env
     if mine.get("status") == "INVALID" or (theirs.get("status") == "INVALID" and mine.get("reward") is None):
         raise SystemExit("the engine rejected a deck at match start (kaggle status INVALID). "
                          "Run with validation on, or check the deck for a rule the validator does not cover.")
     if theirs.get("reward") is None or mine.get("reward") is None:
-        return "void", "engine error (not counted)"
+        return "void", "engine error (not counted)", env
     a, b = mine["reward"], theirs["reward"]
-    reason = infer_reason(last, state["my_index"])
-    return ("win" if a > b else "loss" if b > a else "draw"), reason
+    outcome = "win" if a > b else "loss" if b > a else "draw"
+    reason = infer_reason(last, state["my_index"], outcome == "loss")
+    return outcome, reason, env
 
 
 def wilson(w, n, z=1.96):
@@ -368,17 +381,21 @@ def wilson(w, n, z=1.96):
     return max(0, c - h), min(1, c + h)
 
 
-def run_series(root, deck, opp_deck, games, label):
+def run_series(root, deck, opp_deck, games, label, replay_path=None):
     stats = {"decisions": 0, "multi": 0, "first_choice": 0, "truncated": 0,
-             "forfeits": collections.Counter(), "first_error": None, "wall_ms": []}
+             "forfeits": collections.Counter(), "first_error": None, "wall_ms": [], "replay_env": None}
     tally = collections.Counter()
     reasons = collections.Counter()
     print(f"vs {label}: ", end="", flush=True)
     for g in range(games):
-        outcome, reason = play_one(root, deck, opp_deck, g, stats)
+        outcome, reason, env = play_one(root, deck, opp_deck, g, stats)
         tally[outcome] += 1
         if outcome in ("loss", "forfeit"):
             reasons[reason] += 1
+            if stats["replay_env"] is None:
+                stats["replay_env"] = env
+        if stats["replay_env"] is None and g == games - 1:
+            stats["replay_env"] = env
         print(".", end="", flush=True)
         if outcome == "forfeit" and sum(stats["forfeits"].values()) >= 3:
             print(f"\n  stopped after 3 forfeits — the platform quarantines a version after 3 consecutive timeouts")
@@ -391,6 +408,14 @@ def run_series(root, deck, opp_deck, games, label):
           + (f"   win rate {w / n * 100:.0f}%  (95% CI {lo * 100:.0f}–{hi * 100:.0f}%)" if n else ""))
     if reasons:
         print("  losses by (inferred):", dict(reasons.most_common()))
+    if replay_path and stats["replay_env"] is not None:
+        try:
+            html = stats["replay_env"].render(mode="html")
+            with open(replay_path, "w") as f:
+                f.write(html)
+            print(f"  replay of the first loss written to {replay_path}")
+        except Exception as e:
+            print(f"  (could not write replay: {e})")
     return stats
 
 
@@ -400,6 +425,8 @@ def main():
     p.add_argument("--games", type=int, default=30, help="games per opponent (default 30; use 200 to compare strategies)")
     p.add_argument("--opponent", choices=["both", "mirror", "reference"], default="both")
     p.add_argument("--skip-validation", action="store_true", help="play even if the card catalog cannot be fetched")
+    p.add_argument("--competition", metavar="ID", help="validate against that competition's catalog instead of the platform default")
+    p.add_argument("--replay", metavar="FILE.html", help="write an HTML replay of your first lost game (per opponent, suffixed)")
     args = p.parse_args()
     if args.games < 1:
         p.error("--games must be at least 1")
@@ -418,7 +445,7 @@ def main():
     try:
         deck = load_manifest(root)
         try:
-            by_id = fetch_catalog()
+            by_id = fetch_catalog(args.competition)
         except Exception as e:
             if not args.skip_validation:
                 raise SystemExit(f"could not fetch the card catalog ({e}). The platform validates against it, so this "
@@ -445,7 +472,11 @@ def main():
 
         all_stats = []
         for label, opp_deck in opponents:
-            all_stats.append(run_series(root, deck, opp_deck, args.games, label))
+            rp = None
+            if args.replay:
+                base, ext = os.path.splitext(args.replay)
+                rp = f"{base}-{label.split()[0]}{ext or '.html'}"
+            all_stats.append(run_series(root, deck, opp_deck, args.games, label, rp))
             print()
 
         # aggregate diagnostics
